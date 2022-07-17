@@ -7,5 +7,5 @@ pub mod minecraft;
 /// Mojang API implementation.
 pub mod mojang;
 
-pub use minecraft::{client::MinecraftClient, server::MinecraftServer, status::StatusChecker};
+pub use minecraft::{client::MinecraftClient, server::{MinecraftServer, event}, status::StatusChecker};
 pub use mojang::auth;

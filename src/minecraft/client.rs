@@ -1,13 +1,16 @@
 use super::{connection::MinecraftConnection, proto, Packet};
 use anyhow::Result;
 use mcproto_rs::{protocol::State, types::CountedArray};
-use std::net::SocketAddr;
+use openssl::rsa::{Rsa, Padding};
+use std::{net::SocketAddr};
 
 use std::sync::Arc;
 use tokio::{sync::{
     mpsc::{self, error::TryRecvError, Receiver, Sender},
-    Mutex, broadcast,
+    broadcast, RwLock,
 }, runtime::Runtime, task::JoinHandle};
+
+use super::server::NameUUID;
 
 /// Error text when the client is not connected to a server.
 const SERVER_NONE_ERROR: &str = "Not connected to server.";
@@ -21,7 +24,7 @@ pub struct MinecraftClient {
     /// Tokio runtime
     runtime: Runtime,
     /// Running instance of the client
-    runner: Arc<Mutex<ClientRunner>>,
+    runner: Arc<RwLock<ClientRunner>>,
 }
 
 struct ClientRunner {
@@ -31,8 +34,6 @@ struct ClientRunner {
     connected: bool,
     /// When the client is connected, this holds the actual connection to the server.
     server: Option<MinecraftConnection>,
-    /// Bus for sending packets to any attached receivers
-    packet_tx: broadcast::Sender<Packet>,
 }
 
 impl MinecraftClient {
@@ -56,14 +57,11 @@ impl MinecraftClient {
     /// );
     /// ```
     pub fn new(address: SocketAddr, profile: crate::auth::Profile) -> MinecraftClient {
-        let (packet_tx, _) = broadcast::channel(16);
-
-        let runner = Arc::new(Mutex::new(
+        let runner = Arc::new(RwLock::new(
             ClientRunner {
                 profile,
                 server: None,
                 connected: false,
-                packet_tx,
             }
         ));
         Self {
@@ -99,7 +97,7 @@ impl MinecraftClient {
 
         // Start the TCP connection and wait for completion
         {
-            let mut runner = runner_mut.lock().await;
+            let mut runner = runner_mut.write().await;
             // Authenticate profile
             let auth = runner.profile.authenticate().await;
     
@@ -164,56 +162,65 @@ impl MinecraftClient {
     /// block_on(client.send_chat_message("Hello!")); // Send the chat message. Assumes success of connection
     /// ```
     pub async fn send_chat_message(&self, msg: &str) {
-        let mut runner = self.runner.lock().await;
+        let runner = self.runner.read().await;
         runner.send_chat_message(msg).await.unwrap();
     }
 
-    /// Returns a BusReader that can listen for packets processed by the client
-    pub async fn add_packet_receiver(&self) -> broadcast::Receiver<Packet> {
-        self.runner.lock().await.packet_tx.subscribe()
+    pub async fn send_packet(&self, packet: Packet) -> Result<()> {
+        self.runner.read().await.send_packet(packet).await
+    }
+
+    /// Receive packets that the client will send to the server
+    pub async fn subscribe_to_serverbound_packets(&self) -> broadcast::Receiver<Packet> {
+        self.runner.read().await.subscribe_to_serverbound_packets()
+    }
+
+    /// Receive packets that the server has sent to the client
+    pub async fn subscribe_to_clientbound_packets(&self) -> broadcast::Receiver<Packet> {
+        self.runner.read().await.subscribe_to_clientbound_packets()
+    }
+
+    pub async fn get_name_uuid(&self) -> NameUUID {
+        let profile = &self.runner.read().await.profile.game_profile;
+        (
+            profile.name.clone(),
+            profile.id,
+        )
     }
 }
 
 impl ClientRunner {
     /// Starts the client loop and listens for incoming server packets
-    async fn start_loop(client: Arc<Mutex<Self>>, mut receiver: Receiver<()>) {
+    async fn start_loop(client: Arc<RwLock<Self>>, mut receiver: Receiver<()>) {
         let client_arc = client.clone();
+        debug!("[Client] Starting client loop");
         loop {
             if let Err(err) = receiver.try_recv() {
-                if err == TryRecvError::Closed {
+                if err == TryRecvError::Disconnected {
                     println!("[Client] Closed receiver connection");
                     break;
                 }
-                let mut client_lock = client_arc.lock().await;
+                let client_lock = client_arc.read().await;
                 if !client_lock.connected {
                     println!("[Client] Disconnected from server");
                     break;
                 }
-                let packet_read: Result<super::Packet>;
-                {
-                    // Attempt to read a client packet. Only attempt for 5 ms to allow others to take the lock
-                    let delayer = client_lock.read_packet();
-                    if let Ok(packet) =
-                        tokio::time::timeout(std::time::Duration::from_millis(5), delayer)
-                            .await
-                    {
-                        packet_read = packet;
-                    } else {
-                        continue;
+                let packet_read = {
+                    match client_lock.read_packet().await {
+                        Ok(packet) => packet,
+                        Err(e) => {
+                            error!("[Client] {:?}", e);
+                            continue;
+                        },
                     }
-                }
+                };
                 // Process a packet if deserialized correctly
-                match packet_read {
-                    Ok(packet) => client_lock.handle_packet(packet).await,
-                    Err(e) => {
-                        error!("[Client] {e}")
-                    },
-                }
+                client_lock.handle_packet(packet_read).await
             }
         }
     }
 
-    async fn send_chat_message(&mut self, message: &str) -> Result<()> {
+    async fn send_chat_message(&self, message: &str) -> Result<()> {
         let spec = proto::PlayClientChatMessageSpec {
             message: message.to_string(),
         };
@@ -221,17 +228,13 @@ impl ClientRunner {
     }
 
     /// Reads a packet from the server when connected.
-    async fn read_packet(&mut self) -> Result<Packet> {
-        if let Some(server) = &mut self.server {
-            let read = server.read_next_packet().await;
-            if let Ok(possible_packet) = read {
-                if let Some(packet) = possible_packet {
-                    Ok(packet)
-                } else {
-                    Err(anyhow::anyhow!("Empty packet."))
-                }
+    async fn read_packet(&self) -> Result<Packet> {
+        if let Some(server) = &self.server {
+            let possible_packet = server.read_next_packet().await?;
+            if let Some(packet) = possible_packet {
+                Ok(packet)
             } else {
-                Err(read.err().unwrap())
+                Err(anyhow::anyhow!(""))
             }
         } else {
             Err(anyhow::anyhow!(SERVER_NONE_ERROR))
@@ -239,8 +242,9 @@ impl ClientRunner {
     }
 
     /// Sends a packet to the server when connected.
-    async fn send_packet(&mut self, packet: Packet) -> Result<()> {
-        if let Some(server) = &mut self.server {
+    async fn send_packet(&self, packet: Packet) -> Result<()> {
+        if let Some(server) = &self.server {
+            debug!("[Client] Writing packet: {:?}", packet);
             server.write_packet(packet).await
         } else {
             Err(anyhow::anyhow!(SERVER_NONE_ERROR))
@@ -248,9 +252,9 @@ impl ClientRunner {
     }
 
     /// Sets the client's current state (Handshake, Login, Play, Status), should match server.
-    fn set_state(&mut self, new_state: State) -> Result<()> {
+    async fn set_state(&mut self, new_state: State) -> Result<()> {
         if let Some(server) = &mut self.server {
-            server.set_state(new_state);
+            server.set_state(new_state).await;
             Ok(())
         } else {
             Err(anyhow::anyhow!(SERVER_NONE_ERROR))
@@ -262,12 +266,13 @@ impl ClientRunner {
         if self.connected {
             Err(anyhow::anyhow!("Already connected."))
         } else {
-            if let Some(server) = &mut self.server {
-                server.set_compression_threshold(threshold);
+            if let Some(server) = &self.server {
+                server.set_compression_threshold(threshold).await;
+                debug!("[Client] Enabled compression");
                 let read = self.read_packet().await;
                 if let Ok(packet) = read {
                     match packet {
-                        Packet::LoginSuccess(spec) => self.login_success(spec),
+                        Packet::LoginSuccess(spec) => self.login_success(spec).await,
                         _ => Err(anyhow::anyhow!(WRONG_PACKET_ERROR)),
                     }
                 } else {
@@ -290,24 +295,44 @@ impl ClientRunner {
                 "Cannot use encryption with offline account."
             ));
         }
-        let key = &spec.public_key.as_slice();
-        let token = &spec.verify_token.as_slice();
-        if let Some(server) = &mut self.server {
-            let buf: &mut [u8] = &mut [0; 16];
-            for mut _i in buf.iter() {
+        if let Some(server) = &self.server {
+            debug!("[Client] Establishing an encrypted connection...");
+            // Public key from server
+            let public_key = &spec.public_key.as_slice();
+            // Parse the public key
+            let public_key_rsa = Rsa::public_key_from_der(public_key).unwrap();
+            // Generate a random shared secret to share with the server. Must encrpyt with public key
+            let shared_secret: &mut [u8] = &mut [0; 16];
+            for mut _i in shared_secret.iter() {
                 _i = &rand::random::<u8>();
             }
+            // Buffer to store encrypted secret into
+            let mut shared_secret_enc: Vec<u8> = vec![0; public_key_rsa.size() as usize];
+            // Encrypt the secret
+            public_key_rsa.public_encrypt(&shared_secret, &mut shared_secret_enc, Padding::PKCS1).unwrap();
+            // Trim the padding
+            let shared_secret_enc = &shared_secret_enc[0..16];
+
+            // Encrypt verify token with the public key
+            let mut verify_token_enc: Vec<u8> = vec![0; public_key_rsa.size() as usize];
+            public_key_rsa.public_encrypt(&spec.verify_token, &mut verify_token_enc, Padding::PKCS1).unwrap();
+            // Trim the padding
+            let verify_token_enc = &verify_token_enc[0..16];
+
+            // Create encryption response packet and send
             let response_spec = proto::LoginEncryptionResponseSpec {
-                shared_secret: CountedArray::from(buf.to_vec()),
-                verify_token: spec.verify_token.clone(),
+                shared_secret: CountedArray::from(shared_secret_enc.to_vec()),
+                verify_token: CountedArray::from(verify_token_enc.to_vec()),
             };
-            let auth = self.profile.join_server(spec.server_id, buf, key).await;
+            let auth = self.profile.join_server(spec.server_id, &shared_secret_enc[0..16], public_key).await;
+
             if let Ok(_) = auth {
                 let respond = server
                     .write_packet(Packet::LoginEncryptionResponse(response_spec))
                     .await;
                 if let Ok(_) = respond {
-                    let enable = server.enable_encryption(key, token);
+                    let enable = server.enable_encryption(&shared_secret, &shared_secret).await;
+                    debug!("[Client] Enabled encryption");
                     if let Ok(_) = enable {
                         let read = self.read_packet().await;
                         if let Ok(packet) = read {
@@ -315,7 +340,7 @@ impl ClientRunner {
                                 Packet::LoginSetCompression(body) => {
                                     self.set_compression_threshold(body.threshold.0).await
                                 }
-                                Packet::LoginSuccess(spec) => self.login_success(spec),
+                                Packet::LoginSuccess(spec) => self.login_success(spec).await,
                                 _ => Err(anyhow::anyhow!(WRONG_PACKET_ERROR)),
                             }
                         } else {
@@ -336,13 +361,14 @@ impl ClientRunner {
     }
 
     /// Executed when server login succeeds.
-    fn login_success(&mut self, spec: proto::LoginSuccessSpec) -> Result<()> {
+    async fn login_success(&mut self, spec: proto::LoginSuccessSpec) -> Result<()> {
+        debug!("[Client] Login success!");
         self.connected = true;
         if self.profile.offline {
             self.profile.game_profile.id = spec.uuid;
             self.profile.game_profile.name = spec.username;
         }
-        self.set_state(State::Play)
+        self.set_state(State::Play).await
     }
 
     /// Completes the clientside part of the Minecraft login sequence.
@@ -350,6 +376,7 @@ impl ClientRunner {
         if self.connected {
             return Err(anyhow::anyhow!("Already connected."));
         }
+        debug!("[Client] Ready to start login procedure");
         let read = self.read_packet().await;
         if let Ok(packet) = read {
             match packet {
@@ -357,7 +384,7 @@ impl ClientRunner {
                 Packet::LoginSetCompression(body) => {
                     self.set_compression_threshold(body.threshold.0).await
                 }
-                Packet::LoginSuccess(spec) => self.login_success(spec),
+                Packet::LoginSuccess(spec) => self.login_success(spec).await,
                 _ => Err(anyhow::anyhow!(WRONG_PACKET_ERROR)),
             }
         } else {
@@ -366,20 +393,26 @@ impl ClientRunner {
     }
 
     /// Handle received packets.
-    async fn handle_packet(&mut self, packet: Packet) {
+    async fn handle_packet(&self, packet: Packet) {
         match &packet {
-            Packet::PlayServerChatMessage(body) => {
-                if body.sender != self.profile.game_profile.id {
-                    if let Some(message) = body.message.to_traditional() {
-                        debug!("[Client] {}", message);
-                    } else {
-                        debug!("[Client] Raw message: {:?}", body);
-                    }
-                }
-            }
+            // Packet::PlayServerChatMessage(body) => {
+            //     if body.sender != self.profile.game_profile.id {
+            //         if let Some(message) = body.message.to_traditional() {
+            //             debug!("[Client] {}", message);
+            //         } else {
+            //             debug!("[Client] Raw message: {:?}", body);
+            //         }
+            //     }
+            // },
             _ => {}
         };
+    }
 
-        self.packet_tx.send(packet).unwrap();
+    fn subscribe_to_serverbound_packets(&self) -> broadcast::Receiver<Packet> {
+        self.server.as_ref().unwrap().subscribe_write_packets()
+    }
+
+    fn subscribe_to_clientbound_packets(&self) -> broadcast::Receiver<Packet> {
+        self.server.as_ref().unwrap().subscribe_read_packets()
     }
 }

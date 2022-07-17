@@ -15,14 +15,14 @@ opt-level = 'z'
 codegen-units = 1
 
 [dependencies]
-tokio = { version = "0.2", features = ["rt-threaded"] }
-mcproto-rs = { git = "https://github.com/Twister915/mcproto-rs", branch = "master", features = ["v1_16_3"], version = "0.2" }
-mctokio = { git = "https://github.com/Twister915/mctokio", branch = "master", version = "0.1" }
+tokio = { version = "1.20.0", features = ["full"] }
+mcproto-rs = { path = "./mcproto-rs", features = ["v1_16_3"] }
+mctokio = { path = "./mctokio" }
 anyhow = "1.0.34"
 rand = "0.3"
-serde_json = "1.0.59"
+serde_json = "1.0.82"
 serde = "1.0.117"
-reqwest = "0.10.8"
+reqwest = "0.11.11"
 hex = "0.4.2"
 futures = "0.3"
 openssl = "0.10.30"

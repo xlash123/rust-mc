@@ -7,15 +7,23 @@ use mcproto_rs::protocol::{PacketDirection, State};
 use mctokio::{Bridge, TcpConnection, TcpReadBridge, TcpWriteBridge};
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
+use tokio::sync::{broadcast, Mutex};
+use std::sync::Arc;
 
 /// Represents a connection to a Mineceraft server.
 pub struct MinecraftConnection {
     /// Read channel of the Server socket.
-    reader: TcpReadBridge,
+    reader: Arc<Mutex<TcpReadBridge>>,
     /// Write channel of the Server socket.
-    writer: TcpWriteBridge,
+    writer: Arc<Mutex<TcpWriteBridge>>,
     /// Where the packets are sent.
     packet_direction: PacketDirection,
+    /// Alerts other thread whenever packets are received
+    packet_read_sender: broadcast::Sender<Packet>,
+    /// Alerts other thread whenever packets are sent
+    packet_write_sender: broadcast::Sender<Packet>,
+    /// IP address and port of connection
+    address: SocketAddr,
 }
 
 impl MinecraftConnection {
@@ -73,11 +81,16 @@ impl MinecraftConnection {
     ///
     /// block_on(connect);
     /// ```
-    pub fn new(connection: TcpConnection, packet_direction: PacketDirection) -> Self {
+    pub fn new(connection: TcpConnection, packet_direction: PacketDirection, address: SocketAddr) -> Self {
+        let (packet_read_sender, _) = broadcast::channel(1 << 21);
+        let (packet_write_sender, _) = broadcast::channel(1 << 21);
         return Self {
-            reader: connection.reader,
-            writer: connection.writer,
+            reader: Arc::new(Mutex::new(connection.reader)),
+            writer: Arc::new(Mutex::new(connection.writer)),
             packet_direction,
+            packet_read_sender,
+            packet_write_sender,
+            address,
         };
     }
 
@@ -114,9 +127,11 @@ impl MinecraftConnection {
     /// block_on(connect);
     /// ```
     pub fn from_tcp_stream(connection: TcpStream) -> Self {
+        let address = connection.local_addr().unwrap();
         Self::new(
             TcpConnection::from_client_connection(connection),
             PacketDirection::ClientBound,
+            address,
         )
     }
 
@@ -149,7 +164,7 @@ impl MinecraftConnection {
     pub async fn connect_async(address: SocketAddr) -> Result<Self, std::io::Error> {
         let connection = TcpConnection::connect_to_server(address).await;
         if let Ok(connected) = connection {
-            Ok(Self::new(connected, PacketDirection::ServerBound))
+            Ok(Self::new(connected, PacketDirection::ServerBound, address))
         } else {
             Err(connection.err().unwrap())
         }
@@ -276,11 +291,12 @@ impl MinecraftConnection {
                 if let Some(Packet::Handshake(body)) = first {
                     match body.next_state {
                         HandshakeNextState::Status => {
-                            self.set_state(State::Status);
+                            debug!("[Server] Received request for status");
+                            self.set_state(State::Status).await;
                             return Ok(State::Status);
                         }
                         HandshakeNextState::Login => {
-                            self.set_state(State::Login);
+                            self.set_state(State::Login).await;
                             return Ok(State::Login);
                         }
                     }
@@ -294,15 +310,16 @@ impl MinecraftConnection {
             if let Some(next_state) = next_state {
                 let handshake = proto::HandshakeSpec {
                     version: mcproto_rs::types::VarInt::from(753),
-                    server_address: "".to_string(),
-                    server_port: 25565,
+                    server_address: self.address.ip().to_string(),
+                    server_port: self.address.port(),
                     next_state: next_state.clone(),
                 };
+                debug!("[Client] Starting handshake");
                 if let Err(error) = self.write_packet(Packet::Handshake(handshake)).await {
                     return Err(error);
                 } else {
                     if next_state == proto::HandshakeNextState::Status {
-                        self.set_state(State::Status);
+                        self.set_state(State::Status).await;
                         if let Err(error) = self
                             .write_packet(Packet::StatusRequest(proto::StatusRequestSpec {}))
                             .await
@@ -311,7 +328,7 @@ impl MinecraftConnection {
                         }
                         return Ok(State::Status);
                     } else {
-                        self.set_state(State::Login);
+                        self.set_state(State::Login).await;
                         if let Some(name) = name {
                             if let Err(error) = self
                                 .write_packet(Packet::LoginStart(proto::LoginStartSpec {
@@ -321,6 +338,7 @@ impl MinecraftConnection {
                             {
                                 return Err(error);
                             }
+                            debug!("[Client] Entered Login state");
                             return Ok(State::Login);
                         } else {
                             return Err(anyhow::anyhow!(
@@ -369,8 +387,19 @@ impl MinecraftConnection {
     ///
     /// block_on(send_packet);
     /// ```
-    pub async fn write_packet(&mut self, packet: Packet) -> Result<()> {
-        self.writer.write_packet(packet).await
+    pub async fn write_packet(&self, packet: Packet) -> Result<()> {
+        let packet_clone = packet.clone();
+        {
+            self.writer.lock().await.write_packet(packet).await?;
+        }
+        if self.packet_write_sender.receiver_count() > 0 {
+            self.packet_write_sender.send(packet_clone).unwrap_or_else(|e| {
+                debug!("Failed to send written packet: {:?}", e.0);
+                debug!("# of Writes: {}", self.packet_write_sender.receiver_count());
+                0
+            });
+        }
+        Ok(())
     }
 
     /// Reads the next packet from the buffer of packets received from the target.
@@ -399,9 +428,19 @@ impl MinecraftConnection {
     ///
     /// block_on(set_compression_threshold);
     /// ```
-    pub async fn read_next_packet(&mut self) -> Result<Option<Packet>> {
-        if let Some(raw) = self.reader.read_packet::<RawPacket>().await? {
-            Ok(Some(mcproto_rs::protocol::RawPacket::deserialize(&raw)?))
+    pub async fn read_next_packet(&self) -> Result<Option<Packet>> {
+        if let Some(raw) = {
+            self.reader.lock().await.read_packet::<RawPacket>().await?
+        } {
+            let packet = mcproto_rs::protocol::RawPacket::deserialize(&raw)?;
+            if self.packet_read_sender.receiver_count() > 0 {
+                self.packet_read_sender.send(packet.clone()).unwrap_or_else(|e| {
+                    debug!("Failed to send read packet: {:?}", e.0);
+                    debug!("# of Reads: {}", self.packet_read_sender.receiver_count());
+                    0
+                });
+            }
+            Ok(Some(packet))
         } else {
             Ok(None)
         }
@@ -435,9 +474,9 @@ impl MinecraftConnection {
     ///
     /// block_on(set_state);
     /// ```
-    pub fn set_state(&mut self, state: State) {
-        self.reader.set_state(state.clone());
-        self.writer.set_state(state);
+    pub async fn set_state(&self, state: State) {
+        self.reader.lock().await.set_state(state.clone());
+        self.writer.lock().await.set_state(state);
     }
 
     /// Enables encryption for this connection
@@ -445,8 +484,8 @@ impl MinecraftConnection {
     ///
     /// # Arguments
     ///
-    /// * `key` Public key of the server.
-    /// * `iv` Initial vector for the encryption, usually the server's ID.
+    /// * `key` the shared secret key created by the connected client.
+    /// * `iv` initialization vector, usually just the shared key.
     ///
     /// # Examples
     ///
@@ -469,13 +508,10 @@ impl MinecraftConnection {
     ///
     /// block_on(set_state);
     /// ```
-    pub fn enable_encryption(&mut self, key: &[u8], iv: &[u8]) -> Result<()> {
-        let reader = self.reader.enable_encryption(key, iv);
-        if let Err(error) = reader {
-            Err(error)
-        } else {
-            self.writer.enable_encryption(key, iv)
-        }
+    pub async fn enable_encryption(&self, key: &[u8], iv: &[u8]) -> Result<()> {
+        self.reader.lock().await.enable_encryption(key, iv)?;
+        self.writer.lock().await.enable_encryption(key, iv)?;
+        Ok(())
     }
 
     /// Sets the size packets can reach before being compressed
@@ -505,8 +541,16 @@ impl MinecraftConnection {
     ///
     /// block_on(set_compression_threshold);
     /// ```
-    pub fn set_compression_threshold(&mut self, threshold: i32) {
-        self.reader.set_compression_threshold(Some(threshold));
-        self.writer.set_compression_threshold(Some(threshold));
+    pub async fn set_compression_threshold(&self, threshold: i32) {
+        self.reader.lock().await.set_compression_threshold(Some(threshold));
+        self.writer.lock().await.set_compression_threshold(Some(threshold));
+    }
+
+    pub fn subscribe_read_packets(&self) -> broadcast::Receiver<Packet> {
+        self.packet_read_sender.subscribe()
+    }
+
+    pub fn subscribe_write_packets(&self) -> broadcast::Receiver<Packet> {
+        self.packet_write_sender.subscribe()
     }
 }
