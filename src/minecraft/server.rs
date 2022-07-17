@@ -10,8 +10,8 @@ use std::{
 
 use mcproto_rs::status::StatusPlayerSampleSpec;
 
-use tokio::{sync::{mpsc, broadcast, RwLock}, net::TcpStream, task::JoinHandle, runtime::Handle};
-use tokio::{net::TcpListener, runtime::Runtime};
+use tokio::{sync::{mpsc, broadcast, RwLock}, net::TcpStream, task::JoinHandle};
+use tokio::{net::TcpListener};
 
 use super::{connection::MinecraftConnection, proto, status::ServerStatus, types::Player, Packet};
 use anyhow::Result;
@@ -28,8 +28,6 @@ type ConnectedPlayers = Arc<RwLock<HashMap<Arc<NameUUID>, Arc<RwLock<ServerClien
 pub struct MinecraftServer {
     /// Address to bind the listener to.
     bind_address: String,
-    /// Tokio runtime. Required for creating threads and having compatibility with mctokio crate
-    runtime: Runtime,
     /// MC Runner
     runner: Arc<RwLock<ServerRunner>>,
 }
@@ -93,8 +91,6 @@ impl MinecraftServer {
             favicon: None,
         };
 
-        let runtime = Runtime::new().unwrap();
-        
         // Create channel to allow for server shutdown in another thread
         let (tx, rx) = mpsc::channel(20);
 
@@ -114,7 +110,6 @@ impl MinecraftServer {
         (
             MinecraftServer {
                 bind_address: bind_address.to_string(),
-                runtime,
                 runner,
             },
             tx,
@@ -128,7 +123,6 @@ impl MinecraftServer {
     ///
     /// * `self_mutex` An Arc-Mutex containing the server that should start listening, mutex is locked as little as possible.
     /// * `receiver` Receiver part of an rx/tx channel, sending anything or closing the channel causes this to stop looping.
-    /// * `runtime` Arc-Mutex containing a tokio runtime, locked as little as possible, used for launching threads to handle individual clients.
     ///
     /// # Examples
     ///
@@ -147,8 +141,6 @@ impl MinecraftServer {
     /// ```
     pub async fn start(&self) -> Result<JoinHandle<()>> {
         let runner_mut = self.runner.clone();
-
-        let runtime_server_loop = self.runtime.handle().clone();
 
         let loop_runner_mut = runner_mut.clone();
 
@@ -200,11 +192,10 @@ impl MinecraftServer {
                 if let Ok((socket, address)) = listener.accept().await {
                     let self_join_arc = loop_runner_mut.clone();
                     let connections = connections.clone();
-                    let runtime_arc = runtime_server_loop.clone();
                     let join = async move {
-                        ServerRunner::handle_client_connect(self_join_arc, runtime_arc, socket, address, connections).await;
+                        ServerRunner::handle_client_connect(self_join_arc, socket, address, connections).await;
                     };
-                    runtime_server_loop.spawn(join);
+                    tokio::spawn(join);
                 }
             }
 
@@ -216,7 +207,7 @@ impl MinecraftServer {
         };
 
         // Spawn server thead
-        let handle = self.runtime.handle().spawn(server_loop);
+        let handle = tokio::spawn(server_loop);
         let err = rx.recv().await;
         match err {
             Some(e) => {
@@ -258,7 +249,7 @@ impl MinecraftServer {
 }
 
 impl ServerRunner {
-    async fn handle_client_connect(self_join_arc: Arc<RwLock<ServerRunner>>, runtime_arc: Handle, socket: TcpStream, address: SocketAddr, connections: ConnectedPlayers) {
+    async fn handle_client_connect(self_join_arc: Arc<RwLock<ServerRunner>>, socket: TcpStream, address: SocketAddr, connections: ConnectedPlayers) {
         let mut client = MinecraftConnection::from_tcp_stream(socket);
         let handshake = client.handshake(None, None).await;
         if let Ok(result) = handshake {
@@ -326,7 +317,7 @@ impl ServerRunner {
                             };
                             if let Ok(packet_ok) = packet_read {
                                 if let Some(packet) = packet_ok {
-                                    server_arc.read().await.handle_packet(packet).await;
+                                    server_arc.read().await.handle_packet(&packet).await;
                                 }
                             };
                         }
@@ -340,7 +331,7 @@ impl ServerRunner {
                     //     }
                     // }
                     let username = login.0.clone();
-                    runtime_arc.spawn(packet_loop);
+                    tokio::spawn(packet_loop);
                     {
                         connections.write().await
                             .insert(Arc::new((login.0, login.1)), server_client);
@@ -394,8 +385,13 @@ impl ServerRunner {
         use mcproto_rs::protocol::State::Play;
         use mcproto_rs::types::CountedArray;
         use proto::{LoginEncryptionRequestSpec, LoginSetCompressionSpec, LoginSuccessSpec};
-        let second = &mut client.read_next_packet().await;
-        if let Ok(Some(LoginStart(body))) = second {
+        let second = client.read_next_packet().await?;
+        if second.is_none() {
+            return Err(anyhow::anyhow!(
+                "Client did not follow up with login start."
+            ));
+        }
+        if let LoginStart(body) = &*second.unwrap() {
             let response_spec = LoginSetCompressionSpec {
                 threshold: mcproto_rs::types::VarInt::from(compression_threshold),
             };
@@ -423,8 +419,13 @@ impl ServerRunner {
                 client.write_packet(LoginEncryptionRequest(encryption_spec)).await?;
 
                 // Grab the encryption response
-                let response = client.read_next_packet().await;
-                if let Ok(Some(LoginEncryptionResponse(response))) = response {
+                let response = client.read_next_packet().await?;
+                if response.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "Client did not send a valid response to the encryption request."
+                    ));
+                }
+                if let LoginEncryptionResponse(response) = &*response.unwrap() {
                     // Decrypt the verify token from the client
                     let mut decrypted_token: Vec<u8> = vec![0; rsa.size() as usize];
                     rsa.private_decrypt(&response.verify_token, &mut decrypted_token, Padding::PKCS1).unwrap();
@@ -463,14 +464,9 @@ impl ServerRunner {
                         ));
                     }
                 } else {
-                    debug!("{:?}", response);
-                    if let Some(error) = response.err() {
-                        return Err(error);
-                    } else {
-                        return Err(anyhow::anyhow!(
-                            "Client did not send a valid response to the encryption request."
-                        ));
-                    }
+                    return Err(anyhow::anyhow!(
+                        "Client did not send a valid response to the encryption request."
+                    ));
                 }
             };
             if let Err(error) = client
@@ -503,43 +499,43 @@ impl ServerRunner {
     async fn handle_status(&mut self, mut client: MinecraftConnection) -> anyhow::Result<()> {
         use super::Packet::{StatusPing, StatusPong, StatusRequest};
         use proto::StatusPongSpec;
-        let second = &mut client.read_next_packet().await;
-        if let Ok(second) = second {
-            if let Some(StatusRequest(_)) = second {
-                {
-                    let connected_players = self.players.read().await;
-                    self.status.players.online = connected_players.len().try_into().unwrap();
-                    let mut players: Vec<StatusPlayerSampleSpec> = vec![];
-                    for player in connected_players.keys() {
-                        players.push(StatusPlayerSampleSpec {
-                            id: player.1,
-                            name: player.0.clone(),
-                        });
-                    }
-                    self.status.players.sample = players;
+        let second = client.read_next_packet().await?;
+        if second.is_none() {
+            return Err(anyhow::anyhow!(
+                "Client did not send valid packet after login handshake."
+            ));
+        }
+        if let StatusRequest(_) = &*second.unwrap() {
+            {
+                let connected_players = self.players.read().await;
+                self.status.players.online = connected_players.len().try_into().unwrap();
+                let mut players: Vec<StatusPlayerSampleSpec> = vec![];
+                for player in connected_players.keys() {
+                    players.push(StatusPlayerSampleSpec {
+                        id: player.1,
+                        name: player.0.clone(),
+                    });
                 }
-                if let Err(error) = self.status.send_status(&mut client).await {
+                self.status.players.sample = players;
+            }
+            if let Err(error) = self.status.send_status(&mut client).await {
+                return Err(error);
+            }
+            let third = client.read_next_packet().await?;
+            if third.is_none() {
+                return Ok(());
+            }
+            if let StatusPing(body) = &*third.unwrap() {
+                if let Err(error) = client
+                    .write_packet(StatusPong(StatusPongSpec {
+                        payload: body.payload,
+                    }))
+                    .await
+                {
                     return Err(error);
                 }
-                let third = client.read_next_packet().await;
-                if let Ok(third) = third {
-                    if let Some(StatusPing(body)) = third {
-                        if let Err(error) = client
-                            .write_packet(StatusPong(StatusPongSpec {
-                                payload: body.payload,
-                            }))
-                            .await
-                        {
-                            return Err(error);
-                        }
-                    }
-                }
-                return Ok(());
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Client did not send valid packet after login handshake."
-                ));
             }
+            return Ok(());
         } else {
             return Err(anyhow::anyhow!(
                 "Client did not send valid packet after login handshake."
@@ -577,7 +573,7 @@ impl ServerRunner {
     }
 
     /// Handle packets sent by connected clients.
-    async fn handle_packet(&self, packet: Packet) {
+    async fn handle_packet(&self, packet: &Packet) {
         // debug!("[Server] Received a packet {:?}", packet);
 
         match &packet {
@@ -697,11 +693,16 @@ impl ServerClient {
         self.connection.write_packet(packet).await
     }
 
-    pub fn subscribe_to_clientbound_packets(&self) -> broadcast::Receiver<Packet> {
+    /// Sends a packet to the connected client
+    pub async fn send_packet_arc(&self, packet: Arc<Packet>) -> Result<()> {
+        self.connection.write_packet_arc(packet).await
+    }
+
+    pub fn subscribe_to_clientbound_packets(&self) -> broadcast::Receiver<Arc<Packet>> {
         self.connection.subscribe_write_packets()
     }
 
-    pub fn subscribe_to_serverbound_packets(&self) -> broadcast::Receiver<Packet> {
+    pub fn subscribe_to_serverbound_packets(&self) -> broadcast::Receiver<Arc<Packet>> {
         self.connection.subscribe_read_packets()
     }
 }

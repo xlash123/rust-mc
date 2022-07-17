@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::{sync::{
     mpsc::{self, error::TryRecvError, Receiver, Sender},
     broadcast, RwLock,
-}, runtime::Runtime, task::JoinHandle};
+}, task::JoinHandle};
 
 use super::server::NameUUID;
 
@@ -21,8 +21,6 @@ const WRONG_PACKET_ERROR: &str = "Recieved an unexpected packet.";
 pub struct MinecraftClient {
     /// The socket address of the server the client will connect to.
     address: SocketAddr,
-    /// Tokio runtime
-    runtime: Runtime,
     /// Running instance of the client
     runner: Arc<RwLock<ClientRunner>>,
 }
@@ -66,7 +64,6 @@ impl MinecraftClient {
         ));
         Self {
             address,
-            runtime: Runtime::new().unwrap(),
             runner,
         }
     }
@@ -129,7 +126,7 @@ impl MinecraftClient {
         let loop_runner_mut = self.runner.clone();
 
         // Start the client loop in a new thread
-        let handle = self.runtime.spawn(async move {
+        let handle = tokio::spawn(async move {
             ClientRunner::start_loop(loop_runner_mut, rx).await;
         });
         
@@ -170,13 +167,17 @@ impl MinecraftClient {
         self.runner.read().await.send_packet(packet).await
     }
 
+    pub async fn send_packet_arc(&self, packet: Arc<Packet>) -> Result<()> {
+        self.runner.read().await.send_packet_arc(packet).await
+    }
+
     /// Receive packets that the client will send to the server
-    pub async fn subscribe_to_serverbound_packets(&self) -> broadcast::Receiver<Packet> {
+    pub async fn subscribe_to_serverbound_packets(&self) -> broadcast::Receiver<Arc<Packet>> {
         self.runner.read().await.subscribe_to_serverbound_packets()
     }
 
     /// Receive packets that the server has sent to the client
-    pub async fn subscribe_to_clientbound_packets(&self) -> broadcast::Receiver<Packet> {
+    pub async fn subscribe_to_clientbound_packets(&self) -> broadcast::Receiver<Arc<Packet>> {
         self.runner.read().await.subscribe_to_clientbound_packets()
     }
 
@@ -215,7 +216,7 @@ impl ClientRunner {
                     }
                 };
                 // Process a packet if deserialized correctly
-                client_lock.handle_packet(packet_read).await
+                client_lock.handle_packet(&packet_read).await
             }
         }
     }
@@ -228,13 +229,13 @@ impl ClientRunner {
     }
 
     /// Reads a packet from the server when connected.
-    async fn read_packet(&self) -> Result<Packet> {
+    async fn read_packet(&self) -> Result<Arc<Packet>> {
         if let Some(server) = &self.server {
             let possible_packet = server.read_next_packet().await?;
             if let Some(packet) = possible_packet {
                 Ok(packet)
             } else {
-                Err(anyhow::anyhow!(""))
+                Err(anyhow::anyhow!("Empty packet"))
             }
         } else {
             Err(anyhow::anyhow!(SERVER_NONE_ERROR))
@@ -242,13 +243,17 @@ impl ClientRunner {
     }
 
     /// Sends a packet to the server when connected.
-    async fn send_packet(&self, packet: Packet) -> Result<()> {
+    async fn send_packet_arc(&self, packet: Arc<Packet>) -> Result<()> {
         if let Some(server) = &self.server {
             debug!("[Client] Writing packet: {:?}", packet);
-            server.write_packet(packet).await
+            server.write_packet_arc(packet).await
         } else {
             Err(anyhow::anyhow!(SERVER_NONE_ERROR))
         }
+    }
+
+    async fn send_packet(&self, packet: Packet) -> Result<()> {
+        self.send_packet_arc(Arc::new(packet)).await
     }
 
     /// Sets the client's current state (Handshake, Login, Play, Status), should match server.
@@ -271,8 +276,8 @@ impl ClientRunner {
                 debug!("[Client] Enabled compression");
                 let read = self.read_packet().await;
                 if let Ok(packet) = read {
-                    match packet {
-                        Packet::LoginSuccess(spec) => self.login_success(spec).await,
+                    match &*packet {
+                        Packet::LoginSuccess(spec) => self.login_success(&spec).await,
                         _ => Err(anyhow::anyhow!(WRONG_PACKET_ERROR)),
                     }
                 } else {
@@ -286,7 +291,7 @@ impl ClientRunner {
 
     /// Enables encryption on the client, requires authentication with mojang.
     /// Still WIP, does not actually work.
-    async fn enable_encryption(&mut self, spec: proto::LoginEncryptionRequestSpec) -> Result<()> {
+    async fn enable_encryption(&mut self, spec: &proto::LoginEncryptionRequestSpec) -> Result<()> {
         if self.connected {
             return Err(anyhow::anyhow!("Already connected."));
         }
@@ -324,7 +329,7 @@ impl ClientRunner {
                 shared_secret: CountedArray::from(shared_secret_enc.to_vec()),
                 verify_token: CountedArray::from(verify_token_enc.to_vec()),
             };
-            let auth = self.profile.join_server(spec.server_id, &shared_secret_enc[0..16], public_key).await;
+            let auth = self.profile.join_server(&spec.server_id, &shared_secret_enc[0..16], public_key).await;
 
             if let Ok(_) = auth {
                 let respond = server
@@ -336,7 +341,7 @@ impl ClientRunner {
                     if let Ok(_) = enable {
                         let read = self.read_packet().await;
                         if let Ok(packet) = read {
-                            match packet {
+                            match &*packet {
                                 Packet::LoginSetCompression(body) => {
                                     self.set_compression_threshold(body.threshold.0).await
                                 }
@@ -361,12 +366,12 @@ impl ClientRunner {
     }
 
     /// Executed when server login succeeds.
-    async fn login_success(&mut self, spec: proto::LoginSuccessSpec) -> Result<()> {
+    async fn login_success(&mut self, spec: &proto::LoginSuccessSpec) -> Result<()> {
         debug!("[Client] Login success!");
         self.connected = true;
         if self.profile.offline {
             self.profile.game_profile.id = spec.uuid;
-            self.profile.game_profile.name = spec.username;
+            self.profile.game_profile.name = spec.username.clone();
         }
         self.set_state(State::Play).await
     }
@@ -379,7 +384,7 @@ impl ClientRunner {
         debug!("[Client] Ready to start login procedure");
         let read = self.read_packet().await;
         if let Ok(packet) = read {
-            match packet {
+            match &*packet {
                 Packet::LoginEncryptionRequest(body) => self.enable_encryption(body).await,
                 Packet::LoginSetCompression(body) => {
                     self.set_compression_threshold(body.threshold.0).await
@@ -393,7 +398,7 @@ impl ClientRunner {
     }
 
     /// Handle received packets.
-    async fn handle_packet(&self, packet: Packet) {
+    async fn handle_packet(&self, packet: &Packet) {
         match &packet {
             // Packet::PlayServerChatMessage(body) => {
             //     if body.sender != self.profile.game_profile.id {
@@ -408,11 +413,11 @@ impl ClientRunner {
         };
     }
 
-    fn subscribe_to_serverbound_packets(&self) -> broadcast::Receiver<Packet> {
+    fn subscribe_to_serverbound_packets(&self) -> broadcast::Receiver<Arc<Packet>> {
         self.server.as_ref().unwrap().subscribe_write_packets()
     }
 
-    fn subscribe_to_clientbound_packets(&self) -> broadcast::Receiver<Packet> {
+    fn subscribe_to_clientbound_packets(&self) -> broadcast::Receiver<Arc<Packet>> {
         self.server.as_ref().unwrap().subscribe_read_packets()
     }
 }

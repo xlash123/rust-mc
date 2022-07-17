@@ -64,9 +64,9 @@ impl StatusChecker {
             if let Ok(_) = &handshake {
                 let packet = server.read_next_packet().await;
                 if let Ok(packet) = packet {
-                    match packet.unwrap() {
+                    match &*packet.unwrap() {
                         Packet::StatusResponse(body) => {
-                            return Ok(body.response);
+                            return Ok(body.response.clone());
                         }
                         _ => return Err(anyhow::anyhow!("Wrong packet.")),
                     }

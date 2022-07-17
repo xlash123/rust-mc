@@ -18,10 +18,10 @@ pub struct MinecraftConnection {
     writer: Arc<Mutex<TcpWriteBridge>>,
     /// Where the packets are sent.
     packet_direction: PacketDirection,
-    /// Alerts other thread whenever packets are received
-    packet_read_sender: broadcast::Sender<Packet>,
-    /// Alerts other thread whenever packets are sent
-    packet_write_sender: broadcast::Sender<Packet>,
+    /// Alerts other thread whenever packets are received. Use Arc<Packet> to avoid cloning entire packets
+    packet_read_sender: broadcast::Sender<Arc<Packet>>,
+    /// Alerts other thread whenever packets are sent. Use Arc<Packet> to avoid cloning entire packets
+    packet_write_sender: broadcast::Sender<Arc<Packet>>,
     /// IP address and port of connection
     address: SocketAddr,
 }
@@ -288,17 +288,21 @@ impl MinecraftConnection {
         if self.packet_direction == PacketDirection::ClientBound {
             let first = self.read_next_packet().await;
             if let Ok(first) = first {
-                if let Some(Packet::Handshake(body)) = first {
-                    match body.next_state {
-                        HandshakeNextState::Status => {
-                            debug!("[Server] Received request for status");
-                            self.set_state(State::Status).await;
-                            return Ok(State::Status);
+                if let Some(p) = first {
+                    if let Packet::Handshake(body) = &*p {
+                        match body.next_state {
+                            HandshakeNextState::Status => {
+                                debug!("[Server] Received request for status");
+                                self.set_state(State::Status).await;
+                                return Ok(State::Status);
+                            }
+                            HandshakeNextState::Login => {
+                                self.set_state(State::Login).await;
+                                return Ok(State::Login);
+                            }
                         }
-                        HandshakeNextState::Login => {
-                            self.set_state(State::Login).await;
-                            return Ok(State::Login);
-                        }
+                    } else {
+                        return Err(anyhow::anyhow!("Did not receive handshake packet."));
                     }
                 } else {
                     return Err(anyhow::anyhow!("Did not receive handshake packet."));
@@ -387,19 +391,22 @@ impl MinecraftConnection {
     ///
     /// block_on(send_packet);
     /// ```
-    pub async fn write_packet(&self, packet: Packet) -> Result<()> {
-        let packet_clone = packet.clone();
+    pub async fn write_packet_arc(&self, packet: Arc<Packet>) -> Result<()> {
         {
-            self.writer.lock().await.write_packet(packet).await?;
+            self.writer.lock().await.write_packet(packet.as_ref()).await?;
         }
         if self.packet_write_sender.receiver_count() > 0 {
-            self.packet_write_sender.send(packet_clone).unwrap_or_else(|e| {
+            self.packet_write_sender.send(packet).unwrap_or_else(|e| {
                 debug!("Failed to send written packet: {:?}", e.0);
                 debug!("# of Writes: {}", self.packet_write_sender.receiver_count());
                 0
             });
         }
         Ok(())
+    }
+
+    pub async fn write_packet(&self, packet: Packet) -> Result<()> {
+        self.write_packet_arc(Arc::new(packet)).await
     }
 
     /// Reads the next packet from the buffer of packets received from the target.
@@ -428,11 +435,11 @@ impl MinecraftConnection {
     ///
     /// block_on(set_compression_threshold);
     /// ```
-    pub async fn read_next_packet(&self) -> Result<Option<Packet>> {
+    pub async fn read_next_packet(&self) -> Result<Option<Arc<Packet>>> {
         if let Some(raw) = {
             self.reader.lock().await.read_packet::<RawPacket>().await?
         } {
-            let packet = mcproto_rs::protocol::RawPacket::deserialize(&raw)?;
+            let packet = Arc::new(mcproto_rs::protocol::RawPacket::deserialize(&raw)?);
             if self.packet_read_sender.receiver_count() > 0 {
                 self.packet_read_sender.send(packet.clone()).unwrap_or_else(|e| {
                     debug!("Failed to send read packet: {:?}", e.0);
@@ -546,11 +553,11 @@ impl MinecraftConnection {
         self.writer.lock().await.set_compression_threshold(Some(threshold));
     }
 
-    pub fn subscribe_read_packets(&self) -> broadcast::Receiver<Packet> {
+    pub fn subscribe_read_packets(&self) -> broadcast::Receiver<Arc<Packet>> {
         self.packet_read_sender.subscribe()
     }
 
-    pub fn subscribe_write_packets(&self) -> broadcast::Receiver<Packet> {
+    pub fn subscribe_write_packets(&self) -> broadcast::Receiver<Arc<Packet>> {
         self.packet_write_sender.subscribe()
     }
 }

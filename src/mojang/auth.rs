@@ -302,7 +302,7 @@ impl Profile {
     /// ```
     pub async fn join_server(
         &self,
-        server_id: String,
+        server_id: &str,
         shared_secret: &[u8],
         public_key: &[u8],
     ) -> Result<()> {
