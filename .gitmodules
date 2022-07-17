@@ -1,6 +1,6 @@
 [submodule "mctokio"]
 	path = mctokio
-	url = https://github.com/Twister915/mctokio
+	url = git@github.com:xlash123/mctokio.git
 [submodule "mcproto-rs"]
 	path = mcproto-rs
-	url = https://github.com/Twister915/mcproto-rs
+	url = git@github.com:xlash123/mcproto-rs.git
