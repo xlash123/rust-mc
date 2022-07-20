@@ -439,15 +439,24 @@ impl MinecraftConnection {
         if let Some(raw) = {
             self.reader.lock().await.read_packet::<RawPacket>().await?
         } {
-            let packet = Arc::new(mcproto_rs::protocol::RawPacket::deserialize(&raw)?);
-            if self.packet_read_sender.receiver_count() > 0 {
-                self.packet_read_sender.send(packet.clone()).unwrap_or_else(|e| {
-                    debug!("Failed to send read packet: {:?}", e.0);
-                    debug!("# of Reads: {}", self.packet_read_sender.receiver_count());
-                    0
-                });
+            let packet = mcproto_rs::protocol::RawPacket::deserialize(&raw);
+            match packet {
+                Ok(packet) => {
+                    let packet = Arc::new(packet);
+                    if self.packet_read_sender.receiver_count() > 0 {
+                        self.packet_read_sender.send(packet.clone()).unwrap_or_else(|e| {
+                            debug!("Failed to send read packet: {:?}", e.0);
+                            debug!("# of Reads: {}", self.packet_read_sender.receiver_count());
+                            0
+                        });
+                    }
+                    Ok(Some(packet))
+                },
+                Err(e) => {
+                    error!("Bad packet: {:?}", raw);
+                    return Err(anyhow::anyhow!("{}", e));
+                }
             }
-            Ok(Some(packet))
         } else {
             Ok(None)
         }

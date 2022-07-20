@@ -8,7 +8,7 @@ use std::{
     sync::Arc, net::SocketAddr,
 };
 
-use mcproto_rs::status::StatusPlayerSampleSpec;
+use mcproto_rs::{status::StatusPlayerSampleSpec, v1_16_3::PlayDisconnectSpec};
 
 use tokio::{sync::{mpsc, broadcast, RwLock}, net::TcpStream, task::JoinHandle};
 use tokio::{net::TcpListener};
@@ -21,7 +21,7 @@ use proto::ChatPosition;
 use openssl::rsa::{Rsa, Padding};
 
 pub type NameUUID = (String, UUID4);
-type ConnectedPlayers = Arc<RwLock<HashMap<Arc<NameUUID>, Arc<RwLock<ServerClient>>>>>;
+type ConnectedPlayers = Arc<RwLock<HashMap<NameUUID, Arc<RwLock<ServerClient>>>>>;
 
 
 /// Represents a Minecraft server.
@@ -280,7 +280,7 @@ impl ServerRunner {
                     {
                         let mut self_lock = self_join_arc.write().await;
                         while self_lock.used_entity_ids.contains(&entity_id) {
-                            entity_id = entity_id + 1;
+                            entity_id = rand::random();
                         }
                         self_lock.used_entity_ids.insert(entity_id);
                     }
@@ -315,12 +315,23 @@ impl ServerRunner {
                             let packet_read = {
                                 client_arc.read().await.connection.read_next_packet().await
                             };
-                            if let Ok(packet_ok) = packet_read {
-                                if let Some(packet) = packet_ok {
-                                    server_arc.read().await.handle_packet(&packet).await;
+                            match packet_read {
+                                Ok(packet_ok) => {
+                                    if let Some(packet) = packet_ok {
+                                        server_arc.read().await.handle_packet(&packet).await;
+                                    } else {
+                                        error!("[Server] Empty packet");
+                                        break;
+                                    }
+                                },
+                                Err(e) => {
+                                    error!("[Server] {:?}", e);
+                                    break;
                                 }
                             };
                         }
+                        // Remove player from this server
+                        server_arc.write().await.handle_player_disconnect(&&client_arc.read().await).await;
                     };
                     // Send JoinGame packet to player
                     // {
@@ -334,7 +345,7 @@ impl ServerRunner {
                     tokio::spawn(packet_loop);
                     {
                         connections.write().await
-                            .insert(Arc::new((login.0, login.1)), server_client);
+                            .insert((login.0, login.1), server_client);
                     }
                     println!("[Server] {} successfully logged in.", address.to_string());
                     // Emit PlayerJoin event
@@ -369,6 +380,16 @@ impl ServerRunner {
                 handshake.err().unwrap()
             )
         }
+    }
+
+    async fn handle_player_disconnect(&mut self, client: &ServerClient) {
+        client.send_packet(Packet::PlayDisconnect(PlayDisconnectSpec {
+            reason: Chat::from_text("Disconnected"),
+        })).await.unwrap();
+        // Remove player from players list
+        self.players.write().await.remove(&(client.name.clone(), client.uuid));
+        self.used_entity_ids.remove(&client.entity_id);
+        println!("[Server] {} has disconnected", client.name);
     }
 
     /// Handle client login.

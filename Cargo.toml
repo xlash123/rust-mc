@@ -19,7 +19,7 @@ tokio = { version = "1.20.0", features = ["full"] }
 mcproto-rs = { path = "./mcproto-rs", features = ["v1_16_3"] }
 mctokio = { path = "./mctokio" }
 anyhow = "1.0.34"
-rand = "0.3"
+rand = "0.8.5"
 serde_json = "1.0.82"
 serde = "1.0.117"
 reqwest = "0.11.11"

@@ -6,17 +6,20 @@ use super::client::MinecraftClient;
 use crate::mojang::auth;
 use mcproto_rs::v1_16_3::{Packet753 as Packet, PlayerInfoActionList,EntityMetadataFieldData};
 use mcproto_rs::uuid::UUID4;
+use std::net::SocketAddr;
 use tokio::task::JoinHandle;
 use std::sync::Arc;
 
 pub struct MinecraftProxy {
     server: Arc<MinecraftServer>,
+    endpoint: SocketAddr,
 }
 
 impl MinecraftProxy {
-    pub fn new(server: MinecraftServer) -> Self {
+    pub fn new(server: MinecraftServer, endpoint: SocketAddr) -> Self {
         Self {
             server: Arc::new(server),
+            endpoint,
         }
     }
 
@@ -26,13 +29,16 @@ impl MinecraftProxy {
 
         let mut server_event_listener = server.subscribe_to_events().await;
 
+        let endpoint = self.endpoint.clone();
+
         // Listen to packets from the server
         let on_server_packet_loop = async move {
             loop {
                 if let Ok(e) = server_event_listener.recv().await {
                     match e {
                         Event::PlayerJoin(id) => {
-                            info!("{} joined! Faking connection", id.0);
+                            let username = id.0.clone();
+                            info!("{} joined! Faking connection", username);
                             // The client as connected to this server
                             let server_client = server.get_server_client(&id).await.unwrap();
                             let mut sc_packet_receive = {
@@ -42,12 +48,12 @@ impl MinecraftProxy {
                             // Packets sent by the client to the server for this player
                             // Create a proxy client to connect to a real server
                             let mut client = MinecraftClient::new(
-                                "192.168.1.146:25566".parse().unwrap(),
-                                auth::Profile::new(&id.0, "", true),
+                                endpoint,
+                                auth::Profile::new(&username, "", true),
                             );
-                            debug!("Attempting connection for {}...", id.0);
-                            let (_handle, _txc) = client.connect().await.unwrap();
-                            info!("Fake {} joined!", id.0);
+                            debug!("Attempting connection for {}...", username);
+                            let (_handle, tx_fake_client) = client.connect().await.unwrap();
+                            info!("Fake {} joined!", username);
                             let mut client_packet_listener = client.subscribe_to_clientbound_packets().await;
                             debug!("Got client packet listener");
 
@@ -59,18 +65,26 @@ impl MinecraftProxy {
                             tokio::spawn(async move {
                                 let client = client;
                                 debug!("[CTS] Starting loop");
-                                let _txc = _txc;
+                                let tx_fake_client = tx_fake_client;
                                 // Forward all packets received by this server to the real server
                                 let cts = async move {
                                     loop {
                                         match sc_packet_receive.recv().await {
                                             Ok(p) => {
                                                 let p = MinecraftProxy::convert_packet_player_uuid(p, &real_uuid, &fake_uuid);
-                                                client.send_packet_arc(p).await.unwrap();
+                                                debug!("[Client] Writing packet: {:?}", p);
+                                                if let Err(e) = client.send_packet_arc(p).await {
+                                                    error!("[Proxy] {e}");
+                                                    break;
+                                                }
                                             },
-                                            Err(e) => debug!("[CTS] Error forwarding packets: {:?}", e),
+                                            Err(e) => {
+                                                debug!("{e}");
+                                                break;
+                                            },
                                         }
                                     }
+                                    debug!("[CTS] Finished loop");
                                 };
                                 // Forward all packets received by the real server to the real client
                                 let stc = async move {
@@ -79,11 +93,27 @@ impl MinecraftProxy {
                                         match client_packet_listener.recv().await {
                                             Ok(p) => {
                                                 let p = MinecraftProxy::convert_packet_player_uuid(p, &real_uuid, &fake_uuid);
-                                                server_client.read().await.send_packet_arc(p).await.unwrap();
+                                                match *p {
+                                                    Packet::PlayDisconnect(_) => {
+                                                        // Manually close the connection
+                                                        drop(tx_fake_client);
+                                                        break;
+                                                    },
+                                                    _ => {},
+                                                }
+                                                if let Err(e) = server_client.read().await.send_packet_arc(p).await {
+                                                    error!("[Proxy] {e}");
+                                                    drop(tx_fake_client);
+                                                    break;
+                                                }
                                             },
-                                            Err(e) => debug!("[STC] Error receiving packets: {:?}", e),
+                                            Err(e) => {
+                                                debug!("{e}");
+                                                break;
+                                            },
                                         }
                                     }
+                                    debug!("[STC] Finished loop");
                                 };
                                 debug!("Starting fake client loops");
                                 let cts_handle = tokio::spawn(cts);
@@ -91,6 +121,7 @@ impl MinecraftProxy {
                                 let res = tokio::join!(cts_handle, stc_handle);
                                 res.0.unwrap();
                                 res.1.unwrap();
+                                debug!("[Proxy] {} dropped", username);
                             });
                         }
                     }

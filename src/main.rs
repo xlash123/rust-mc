@@ -17,7 +17,7 @@ async fn main() {
         true,
     );
     // Give the server to the proxy
-    let proxy = MinecraftProxy::new(server);
+    let proxy = MinecraftProxy::new(server, "127.0.0.1:25566".parse().unwrap());
     // Start the proxy
     let handle = proxy.start().await;
     // Yield

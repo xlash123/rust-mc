@@ -188,6 +188,10 @@ impl MinecraftClient {
             profile.id,
         )
     }
+
+    pub async fn is_connected(&self) -> bool {
+        self.runner.read().await.connected
+    }
 }
 
 impl ClientRunner {
@@ -202,10 +206,6 @@ impl ClientRunner {
                     break;
                 }
                 let client_lock = client_arc.read().await;
-                if !client_lock.connected {
-                    println!("[Client] Disconnected from server");
-                    break;
-                }
                 let packet_read = {
                     match client_lock.read_packet().await {
                         Ok(packet) => packet,
@@ -219,6 +219,13 @@ impl ClientRunner {
                 client_lock.handle_packet(&packet_read).await
             }
         }
+        client.write().await.handle_disconnect().await;
+    }
+
+    async fn handle_disconnect(&mut self) {
+        self.connected = false;
+        self.server.take();
+        println!("[Client] Disconnected from server");
     }
 
     async fn send_chat_message(&self, message: &str) -> Result<()> {
@@ -245,7 +252,6 @@ impl ClientRunner {
     /// Sends a packet to the server when connected.
     async fn send_packet_arc(&self, packet: Arc<Packet>) -> Result<()> {
         if let Some(server) = &self.server {
-            debug!("[Client] Writing packet: {:?}", packet);
             server.write_packet_arc(packet).await
         } else {
             Err(anyhow::anyhow!(SERVER_NONE_ERROR))
