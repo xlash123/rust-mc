@@ -93,10 +93,10 @@ impl MinecraftProxy {
                                         match client_packet_listener.recv().await {
                                             Ok(p) => {
                                                 let p = MinecraftProxy::convert_packet_player_uuid(p, &real_uuid, &fake_uuid);
-                                                match *p {
-                                                    Packet::PlayDisconnect(_) => {
-                                                        // Manually close the connection
-                                                        drop(tx_fake_client);
+                                                match &*p {
+                                                    Packet::PlayDisconnect(spec) => {
+                                                        debug!("[STC] Received disconnect packet");
+                                                        server_client.read().await.kick(spec.reason.clone()).await.unwrap();
                                                         break;
                                                     },
                                                     _ => {},

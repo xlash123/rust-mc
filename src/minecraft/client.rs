@@ -211,12 +211,12 @@ impl ClientRunner {
                         Ok(packet) => packet,
                         Err(e) => {
                             error!("[Client] {:?}", e);
-                            continue;
+                            break;
                         },
                     }
                 };
                 // Process a packet if deserialized correctly
-                client_lock.handle_packet(&packet_read).await
+                client_lock.handle_packet(&packet_read).await;
             }
         }
         client.write().await.handle_disconnect().await;
@@ -403,7 +403,7 @@ impl ClientRunner {
         }
     }
 
-    /// Handle received packets.
+    /// Handle received packets. If disconnected, returns the disconnect reason
     async fn handle_packet(&self, packet: &Packet) {
         match &packet {
             // Packet::PlayServerChatMessage(body) => {
@@ -415,8 +415,8 @@ impl ClientRunner {
             //         }
             //     }
             // },
-            _ => {}
-        };
+            _ => {},
+        }
     }
 
     fn subscribe_to_serverbound_packets(&self) -> broadcast::Receiver<Arc<Packet>> {

@@ -331,7 +331,7 @@ impl ServerRunner {
                             };
                         }
                         // Remove player from this server
-                        server_arc.write().await.handle_player_disconnect(&&client_arc.read().await).await;
+                        server_arc.write().await.handle_player_disconnect(&&client_arc.read().await, None).await;
                     };
                     // Send JoinGame packet to player
                     // {
@@ -382,10 +382,11 @@ impl ServerRunner {
         }
     }
 
-    async fn handle_player_disconnect(&mut self, client: &ServerClient) {
-        client.send_packet(Packet::PlayDisconnect(PlayDisconnectSpec {
-            reason: Chat::from_text("Disconnected"),
-        })).await.unwrap();
+    async fn handle_player_disconnect(&mut self, client: &ServerClient, reason: Option<Chat>) {
+        // Don't handle error, because that just means they already disconnected, which we can't guarantee they'll still be connected at this point
+        let _result = client.send_packet(Packet::PlayDisconnect(PlayDisconnectSpec {
+            reason: reason.unwrap_or_else(|| Chat::from_text("Disconnected")),
+        })).await;
         // Remove player from players list
         self.players.write().await.remove(&(client.name.clone(), client.uuid));
         self.used_entity_ids.remove(&client.entity_id);
