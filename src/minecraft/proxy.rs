@@ -129,7 +129,9 @@ impl MinecraftProxy {
             }
         };
         
-        tokio::spawn(on_server_packet_loop).await.unwrap()
+        let ret = tokio::spawn(on_server_packet_loop);
+        println!("Proxy started with endpoint at {}", self.endpoint);
+        ret
     }
 
     /// Mutate a packet by converting any fake, generated UUIDs into a player's real one
@@ -294,7 +296,11 @@ impl MinecraftProxy {
                 } else {
                     packet
                 }
-            }
+            },
+            // TODO: Add PlayServerChatMessage
+            // Packet::PlayServerChatMessage(spec) => {
+                
+            // }
     
     
             // All other packets can stay the same
