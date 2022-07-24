@@ -13,9 +13,9 @@ use std::sync::Arc;
 /// Represents a connection to a Mineceraft server.
 pub struct MinecraftConnection {
     /// Read channel of the Server socket.
-    reader: Arc<Mutex<TcpReadBridge>>,
+    reader: Mutex<TcpReadBridge>,
     /// Write channel of the Server socket.
-    writer: Arc<Mutex<TcpWriteBridge>>,
+    writer: Mutex<TcpWriteBridge>,
     /// Where the packets are sent.
     packet_direction: PacketDirection,
     /// Alerts other thread whenever packets are received. Use Arc<Packet> to avoid cloning entire packets
@@ -85,8 +85,8 @@ impl MinecraftConnection {
         let (packet_read_sender, _) = broadcast::channel(1 << 21);
         let (packet_write_sender, _) = broadcast::channel(1 << 21);
         return Self {
-            reader: Arc::new(Mutex::new(connection.reader)),
-            writer: Arc::new(Mutex::new(connection.writer)),
+            reader: Mutex::new(connection.reader),
+            writer: Mutex::new(connection.writer),
             packet_direction,
             packet_read_sender,
             packet_write_sender,

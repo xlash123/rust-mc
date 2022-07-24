@@ -15,7 +15,7 @@ async fn main() {
     debug!("Starting proxy server example");
     // Create underlying Minecraft server
     let (server, _tx) = MinecraftServer::new(
-        "127.0.0.1:25565",
+        "0.0.0.0:25565",
         "Rust test MC server",
         5,
         true,
@@ -24,6 +24,7 @@ async fn main() {
     let proxy = MinecraftProxy::new(server, endpoint.parse().unwrap());
     // Start the proxy
     let handle = proxy.start().await;
+
     // Yield
     handle.await.unwrap();
 }
